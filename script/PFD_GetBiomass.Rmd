@@ -1,0 +1,802 @@
+---
+title: "PFD_GetBiomass"
+author: "Lilian VALLET"
+date: '2023-10-31'
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+mainP<-"C:/Users/vallet/Documents/Doctorat/Projet_PFD/"
+figureP<-paste0(mainP,"output_figure/")
+ouputdataP<-paste0(mainP,"output_data/")
+library(tidyverse) # Easily Install and Load the 'Tidyverse'
+library(janitor) # Simple Tools for Examining and Cleaning Dirty Data
+library(sf) # Simple Features for R
+library(RColorBrewer) # ColorBrewer Palettes
+library(readr) # Read Rectangular Text Data
+library(raster) # Geographic Data Analysis and Modeling
+library(fasterize) # Fast Polygon to Raster Conversion
+library(rasterVis) # Visualization Methods for Raster Data
+library(equatiomatic) # Transform Models into 'LaTeX' Equations
+library(allodb) # Tree Biomass Estimation at Extra-Tropical Forest Plots
+library(tidymv) # Tidy Model Visualisation for Generalised Additive Models
+library(foreach) # Provides Foreach Looping Construct
+library(doParallel) # Foreach Parallel Adaptor for the 'parallel' Package
+library(rgdal) # Bindings for the 'Geospatial' Data Abstraction Library
+```
+
+# Method version
+```{r}
+#Fire Database
+fire_DB<-"BAMTS/2023"
+fire_DB_name<-str_extract(fire_DB,pattern = "[:alpha:]+")
+#Which Biomass DB ? Choose between "Schwartz/merged","Globbiomass","ESACCI","Potapov" and "GFED/GFED500France_forFlorent/Mean_stem_pool"
+BM_DB<-"Schwartz/merged"
+suffix_raster=".tif$"
+BM_DB_name<-str_extract(BM_DB,pattern = "[:alpha:]+")
+BM_tree_height<-F
+BM_fine_resolution<-F
+if(BM_DB_name=="Schwartz"){
+  BM_DB_name="OwnMethod"
+  BM_tree_height<-T
+  BM_fine_resolution<-T
+}
+
+if(BM_DB_name=="Potapov"){
+  BM_tree_height<-T
+  }
+
+
+#method_name<-paste0(BM_DB_name,"x",fire_DB_name,"_NEW")
+method_name<-"2023"
+figure_method_path<-paste0(figureP, method_name,"/")
+dir.create(figure_method_path)
+```
+
+#Get data
+```{r}
+#fire data
+fire_path<-"D:/Fire/"
+fire_folder <- paste0(fire_path,fire_DB,"/")
+list_fire<-list.files(fire_folder,pattern=".shp")
+list_fire<-str_sub(list_fire,end=-5)
+
+#Biomass or TreeHeight data
+#Always gat Schwartz DB as reference
+BM_path<-"D:/Forest/"
+BM_folder <- paste0(BM_path,"Schwartz/merged/")
+tile_full_name <- "Export_2022-12-09-WGS84_FULL.tif"
+tile_full_Schwartz <- raster(paste0(BM_folder, tile_full_name))
+
+BM_folder <- paste0(BM_path,BM_DB,"/")
+tile_full_name <- list.files(BM_folder,pattern=suffix_raster)
+tile_full <- raster(paste0(BM_folder, tile_full_name))
+
+#Other DB in case of fine method
+#IFN
+IFN_folder <- "D:/Forest/IFN/"
+##placette
+IFN_placette_name <- "PLACETTE.csv"
+IFN_placette <- read_delim(
+  paste0(IFN_folder, IFN_placette_name),
+  delim = ";",
+  locale = locale(decimal_mark = ".")
+)
+IFN_placette_sf <- st_as_sf(IFN_placette, coords = c("XL", "YL"))
+st_crs(IFN_placette_sf) <- 2154
+IFN_placette_sf <- st_transform(IFN_placette_sf, crs = crs(tile_full))
+
+##trees
+IFN_tree_name <- "ARBRE.csv"
+IFN_tree <- read_delim(
+  paste0(IFN_folder, IFN_tree_name),
+  delim = ";",
+  locale = locale(decimal_mark = ".")
+)
+
+##ESPAR corresponding
+IFN_ESPAR_name <- "espar-cdref13.csv"
+IFN_ESPAR <- read_delim(
+  paste0( IFN_folder, IFN_ESPAR_name),
+  delim = ";",
+  locale = locale(decimal_mark = ".")
+)
+IFN_ESPAR%>%
+  mutate(espar=dplyr::if_else(str_length(espar)==1,paste0("0",espar),espar))->IFN_ESPAR
+
+##Sylvoecoregion
+IFN_SER_name <- "ifn_stats_sylvoecoregions_v1.csv"
+IFN_SER <- read_delim(
+  paste0( IFN_folder, IFN_SER_name),
+  delim = ",",
+  locale = locale(decimal_mark = ".")
+)
+names(IFN_SER)<-make_clean_names(names(IFN_SER))
+
+#DEM
+DEM<-raster("D:/Topography/eu_dem_France_slope_QGIS_WGS84.TIF")
+
+#Copernicus tree cover
+COP_TC<-raster("D:/Forest/Copernicus_Tree_cover/TC/DATA/TCD_France_WGS84.tif")
+
+#Corine Land Cover
+CLC<-st_read("D:/LandUse/CLC/CLC18_FR_RGF_SHP/CLC18_FR_RGF_WGS84.shp")
+CLC%>%
+  filter(CODE_18==323)->CLC_scler
+```
+
+#FUNCTION
+```{r}
+get.fireBM <- function(fire_name) {
+  #Create a folder to hold data and figures created
+  dir.create(paste0(figure_method_path, fire_name))
+  
+  #Fire Shapefile===============================================================
+  ##Get fire ShapeFile and save it----------------------------------------------
+  fire_focused <- st_read(paste0(fire_folder, fire_name, ".shp"))
+  fire_focused_name <- paste0("fire_focused_", fire_name, ".shp")
+  # if(is_empty(fire_focused$geometry[[]])){
+  #   fire_focused%>%
+  #     slice(1)->fire_focused
+  # }
+  
+  
+  ##Plot fire patch and save it-------------------------------------------------
+  fire_focused %>%
+    ggplot() +
+    geom_sf() +
+    theme_light() -> gg_fire_focused
+  gg_fire_focused_name <- paste0("fire_focused_", fire_name, ".png")
+  ggsave(
+    gg_fire_focused,
+    filename = gg_fire_focused_name,
+    path = paste0(figure_method_path, fire_name)
+  )
+  
+  
+  #Schwartz's Tree Height data==================================================
+  ##Get Tree Height on which the fire occurred----------------------------------
+  tile_cropped <- crop(tile_full, fire_focused, snap = "out")
+  
+  if (!BM_fine_resolution) {
+    tile_cropped_schwartz <- crop(tile_full_Schwartz, fire_focused)
+    tile_cropped <-
+      resample(tile_cropped, tile_cropped_schwartz, "ngb")
+  }
+  
+  tile_masked <- mask(tile_cropped, fire_focused)
+  if (BM_DB_name == "GFED") {
+    tile_masked <- tile_masked / 100 * 2#gC/m² to tBM/ha
+  }
+  tile_masked_name <- paste0("tile_masked_", fire_name, ".tif")
+  writeRaster(tile_masked,
+              filename = paste0(figure_method_path, fire_name, "/", tile_masked_name))
+  
+  if (BM_tree_height) {
+    if (BM_DB_name == "OwnMethod") {
+      tile_masked <- tile_masked / 100#Tree height in meter
+    }
+    if (BM_DB_name == "Potapov") {
+      tile_masked[tile_masked > 99] <- NA
+    }
+    if (max(tile_masked@data@values, na.rm = T) < 3)
+    {
+      tile_masked[tile_masked] <- 0
+      BM_forest <- tile_masked
+      
+    } else{
+      # DEM_cropped <- crop(DEM, tile_masked, snap = "in")
+      # DEM_masked <- mask(DEM_cropped, fire_focused)
+      # 
+      # if (BM_DB_name == "OwnMethod" & cellStats(DEM_masked, 'mean') > 3) {
+        COP_TC_cropped <- crop(COP_TC, tile_masked, snap = "out")
+        COP_TC_comparable <- resample(COP_TC_cropped, tile_masked)
+        COP_TC_masked <- mask(COP_TC_comparable, tile_masked)
+        COP_TC_name <-
+        paste0("COP_TC_", fire_name, ".png")
+      png(filename = paste0(figure_method_path, fire_name, "/", COP_TC_name))
+      COP_TC_masked %>%
+        plot() %>%
+        print()
+      dev.off()
+        
+        #tile_masked[COP_TC_masked == 0] <- 0
+      # }
+      
+      tile_masked[tile_masked < 3] <- 0
+      ##Create a buffered patch to use for IFN data---------------------------------
+      fire_buffered <- st_buffer(fire_focused, 5000)
+      
+      ##Plot Tree height map and histogram------------------------------------------
+      ###Levelplot
+      lp_treeheight_name <-
+        paste0("lp_treeheight_", fire_name, ".png")
+      png(filename = paste0(figure_method_path, fire_name, "/", lp_treeheight_name))
+      tile_masked %>%
+        levelplot() %>%
+        print()
+      dev.off()
+      
+      ###Histogram
+      hist_treeheight_name <-
+        paste0("hist_treeheight_", fire_name, ".png")
+      png(filename = paste0(
+        figure_method_path,
+        fire_name,
+        "/",
+        hist_treeheight_name
+      ))
+      tile_masked %>%
+        histogram %>%
+        print()
+      dev.off()
+      
+      #IFN==========================================================================
+      ##Placette--------------------------------------------------------------------
+      ###Get placettes inside in and around fire patch and save it
+      IFN_placette_infire <-
+        st_filter(IFN_placette_sf, fire_buffered)
+      
+      IDP_seq <- IFN_placette_infire$IDP
+      IFN_placette_infire_name <-
+        paste0("IFN_placette_infire_", fire_name, ".shp")
+      st_write(
+        IFN_placette_infire,
+        paste0(
+          figure_method_path,
+          fire_name,
+          "/",
+          IFN_placette_infire_name
+        )
+      )
+      
+      ###Plot Placette position and save it
+      ggplot() +
+        geom_sf(data = fire_focused) +
+        geom_sf(data = IFN_placette_infire, col = "red") +
+        theme_light() -> gg_IFN_placette_infire
+      gg_IFN_placette_infire_name <-
+        paste0("IFN_placette_infire_", fire_name, ".png")
+      ggsave(
+        gg_IFN_placette_infire,
+        filename = gg_IFN_placette_infire_name,
+        path = paste0(figure_method_path, fire_name)
+      )
+      
+      ##Tree------------------------------------------------------------------------
+      ###Get tree in corresponding placette and save it
+      IFN_tree %>%
+        filter(IDP %in% IDP_seq) -> IFN_tree_infire
+      if (dim(IFN_placette_infire)[1] > 1 &
+          length(which(!is.na(IFN_tree_infire$C13))) > 0 &
+          length(which(!is.na(IFN_tree_infire$HTOT))) > 0) {
+        IFN_tree_infire_placette <-
+          full_join(IFN_tree_infire, IFN_placette_infire)
+        IFN_tree_infire_placette <-
+          st_as_sf(IFN_tree_infire_placette)
+        IFN_tree_infire_placette_name <-
+          paste0("IFN_tree_infire_", fire_name, ".shp")
+        st_write(
+          IFN_tree_infire_placette,
+          paste0(
+            figure_method_path,
+            fire_name,
+            "/",
+            IFN_tree_infire_placette_name
+          )
+        )
+        
+        #C13 prediction (m)===============================================================
+        ##Get relationship C13~HTOT---------------------------------------------------
+        ###Create a 2nd polynomial model
+        data_to_fit <-
+          data.frame(y = IFN_tree_infire_placette$C13, values = IFN_tree_infire_placette$HTOT)
+        mod1 <- lm(y ~ 0 + I(values ^ 2), data_to_fit)
+        
+        ###Save model output
+        mod_summary <- summary(mod1)
+        mod_summary_name <-
+          paste0("mod_summary_", fire_name, ".txt")
+        capture.output(mod_summary,
+                       file = paste0(figure_method_path, fire_name, "/", mod_summary_name))
+        
+        ###Show model prediction and save it
+        height_seq <- seq(0:40)
+        C13_predictions <-
+          predict(mod1, data.frame(values = height_seq), se = T)
+        C13_predictions_df <-
+          data.frame(
+            cbind(
+              values = height_seq,
+              fit = C13_predictions$fit,
+              se.fit = C13_predictions$se.fit
+            ),
+            fit_plus = C13_predictions$fit + C13_predictions$se.fit,
+            fit_minus = C13_predictions$fit - C13_predictions$se.fit
+          )
+        ggplot() +
+          geom_point(
+            data = IFN_tree_infire_placette,
+            aes(x = HTOT, y = C13),
+            cex = 2,
+            alpha = 0.6
+          ) +
+          geom_line(data = C13_predictions_df,
+                    aes(x = values, y = fit)) +
+          geom_ribbon(
+            data = C13_predictions_df,
+            aes(
+              x = height_seq,
+              ymin = fit_minus,
+              ymax = fit_plus
+            ),
+            alpha = 0.3
+          ) +
+          theme_light() -> gg_model_prediction
+        gg_model_prediction_name <-
+          paste0("model_prediction_", fire_name, ".png")
+        ggsave(
+          gg_model_prediction,
+          filename = gg_model_prediction_name,
+          path = paste0(figure_method_path, fire_name)
+        )
+        
+        ##Predict C13 (m) on fire patch and save it---------------------------------------
+        # pfun <-
+        #   function(x) {
+        #     if (is.na(x[1])) {
+        #       rep(NA, length(x))
+        #     } else {
+        #       predict(mod1)
+        #     }
+        #   }
+        # p2 <- calc(tile_masked, pfun)
+        C13 <-      mod1$coefficients[1]  *   tile_masked ^ 2
+        C13_name <- paste0("C13_", fire_name, ".tif")
+        writeRaster(C13,
+                    filename = paste0(figure_method_path, fire_name, "/", C13_name))
+        
+        ###Plot C13 predictions and save it
+        raster_C13_name <-
+          paste0("raster_C13_", fire_name, ".png")
+        png(filename = paste0(figure_method_path, fire_name, "/", raster_C13_name))
+        plot(C13)
+        dev.off()
+        
+        
+        C13[C13[] <= 0] <- 0
+        #DBH prediction (m)===============================================================
+        ##Convert C13 into DBH (/pi)--------------------------------------------------
+        DBH <- C13 / pi
+        DBH_name <- paste0("DBH_", fire_name, ".tif")
+        writeRaster(DBH,
+                    filename = paste0(figure_method_path, fire_name, "/", DBH_name))
+        
+        ###Plot DBH predictions and save it
+        raster_DBH_name <-
+          paste0("raster_DBH_", fire_name, ".png")
+        png(filename = paste0(figure_method_path, fire_name, "/", raster_DBH_name))
+        plot(DBH)
+        dev.off()
+        
+        
+        #BM prediction for one tree(kg)=============================================
+        ##Get dominant tree species-------------------------------------------------
+        ###Get ESPAR code for the more numerous species
+        IFN_tree_infire %>%
+          filter(!is.na(ESPAR)) %>%
+          group_by(ESPAR) %>%
+          count -> counted_species
+        dominant_species <-
+          counted_species$ESPAR[which(counted_species$n == max(counted_species$n))][1]
+        
+        ###Get its scientific name
+        IFN_ESPAR %>%
+          filter(espar == dominant_species) %>%
+          pull(lib_cdref) -> dominant_species_scname
+        dominant_species_genus <-
+          str_extract(dominant_species_scname, "[:alpha:]+")
+        dominant_species_genus <- tolower(dominant_species_genus)
+        dominant_species_sp <-
+          str_extract(dominant_species_scname, "[:blank:][:alpha:]+")
+        dominant_species_sp <-
+          str_extract(dominant_species_sp, "[:alpha:]+")
+        sp_name <- paste0("sp_", fire_name, ".txt")
+        write(dominant_species_scname,paste0(figure_method_path, fire_name, "/", sp_name))
+        
+        ##Get fire centroid-----------------------------------------------------------
+        fire_centroid <- st_centroid(fire_focused)
+        fire_position <- fire_centroid$geometry[[1]]
+        
+        ##Adapt allodb function to current species------------------------------------
+        funbm <-
+          function(x) {
+            get_biomass(x,
+                        genus = dominant_species_genus,
+                        species = dominant_species_sp,
+                        coords = fire_position)
+          }
+        
+        ##Predict BM(kg) of fire patch -----------------------------------------------
+        BM_onetree <- calc(DBH * 100, funbm)#DBH to cm
+        BM_onetree[BM_onetree<1]<-0 #to avoid too high density
+        BM_onetree_name <- paste0("BM_onetree_", fire_name, ".tif")
+        writeRaster(BM_onetree,
+                    filename = paste0(figure_method_path, fire_name, "/", BM_onetree_name))
+        
+        ###Plot BM predictions and save it
+        raster_BM_onetree_name <-
+          paste0("raster_BM_onetree_", fire_name, ".png")
+        png(filename = paste0(
+          figure_method_path,
+          fire_name,
+          "/",
+          raster_BM_onetree_name
+        ))
+        plot(BM_onetree, main = dominant_species_scname)
+        dev.off()
+        
+        
+        #Get density and BM IFN data------------------------------------------------
+        ##Get tree in SER-----------------------------------------------------
+        ###
+        IFN_placette_infire %>%
+          filter(!is.na(SER)) %>%
+          group_by(SER) %>%
+          count -> counted_SER
+        dominant_SER <-
+          counted_SER$SER[which(counted_SER$n == max(counted_SER$n))]
+        
+        IFN_placette %>%
+          filter(SER == dominant_SER) -> IFN_placette_inSER
+        IDP_SER <- unique(IFN_placette_inSER$IDP)
+        IFN_tree %>%
+          filter(IDP %in% IDP_SER) -> IFN_tree_inSER
+        
+        #Fill empty C13
+        ##Get median C13 per IDP
+        IFN_tree_inSER%>%
+          group_by(IDP)%>%
+          summarise(C13_med=median(C13,na.rm=T))->IFN_tree_inSER_C13med
+        IFN_tree_inSER<-left_join(IFN_tree_inSER,IFN_tree_inSER_C13med)
+        IFN_tree_inSER%>%
+          mutate(C13=if_else(is.na(C13),C13_med,C13))->IFN_tree_inSER
+        
+        ##Get density of each placette and per circumference class
+        IFN_tree_inSER %>%
+          mutate(
+            circ_class = case_when(
+              C13 < 0.705 ~ "small_wood",
+              C13 < 1.175 ~ "medium_wood",
+              C13 >= 1.175 ~ "large_wood"
+            )
+          ) -> IFN_tree_inSER
+        
+        IFN_tree_inSER %>%
+          group_by(IDP, circ_class, CAMPAGNE) %>%
+          count %>%
+          mutate(
+            n_ha = case_when(
+              circ_class == "large_wood" ~ n * 10000 / (pi * 15 ^ 2),
+              circ_class == "medium_wood" ~ n * 10000 / (pi * 9 ^ 2),
+              circ_class == "small_wood" ~ n * 10000 / (pi * 6 ^ 2)
+            )
+          ) %>%
+          group_by(IDP,CAMPAGNE) %>%
+          summarise(pop_density = sum(n_ha)) -> IFN_pop_density
+        
+        #Get BM of each tree
+        IFN_tree_inSER %>%
+          filter(ESPAR == dominant_species) %>%
+          filter(IDP%in% IDP_SER)%>%
+          mutate(DBH = C13 / pi) %>%
+          mutate(BM = funbm(DBH * 100)) -> BM_tree_inSER
+        
+        ###Join BM and density
+        IFN_tree_inSER_density <-
+          left_join(BM_tree_inSER, IFN_pop_density)
+        
+        
+        if (dim(IFN_tree_inSER_density)[1] == 0) {
+          #Fill empty C13
+        ##Get median C13 per IDP
+        IFN_tree%>%
+          group_by(IDP)%>%
+          summarise(C13_med=median(C13,na.rm=T))->IFN_tree_C13med
+        IFN_tree<-left_join(IFN_tree,IFN_tree_C13med)
+        IFN_tree%>%
+          mutate(C13=if_else(is.na(C13),C13_med,C13))->IFN_tree
+          ##Get density of each placette and per circumference class
+          IFN_tree %>%
+            filter(ESPAR == dominant_species) %>%
+            filter(IDP%in% IDP_SER)%>%
+            mutate(
+              circ_class = case_when(
+                C13 < 0.705 ~ "small_wood",
+                C13 < 1.175 ~ "medium_wood",
+                C13 >= 1.175 ~ "large_wood"
+              )
+            ) -> IFN_tree_dom
+          
+          IFN_tree_dom %>%
+            group_by(IDP, circ_class, CAMPAGNE) %>%
+            count %>%
+            mutate(
+              n_ha = case_when(
+                circ_class == "large_wood" ~ n * 10000 / (pi * 15 ^ 2),
+                circ_class == "medium_wood" ~ n * 10000 / (pi * 9 ^ 2),
+                circ_class == "small_wood" ~ n * 10000 / (pi * 6 ^ 2)
+              )
+            ) %>%
+            group_by(IDP, CAMPAGNE) %>%
+            summarise(pop_density = sum(n_ha)) -> IFN_pop_density
+          
+          #Get BM of each tree
+          IFN_tree %>%
+            filter(IDP%in% IDP_SER)%>%
+            filter(ESPAR == dominant_species) %>%
+            mutate(DBH = C13 / pi) %>%
+            mutate(BM = funbm(DBH * 100)) -> BM_tree_inSER
+          
+          ###Join BM and density
+          IFN_tree_inSER_density <-
+            left_join(BM_tree_inSER, IFN_pop_density)
+        }
+        
+        ##From dominant tree to mean tree
+        IFN_tree_inSER_density%>%
+          group_by(IDP,CAMPAGNE)%>%
+          slice_max(BM)->IFN_tree_inSER_density_max
+
+        IFN_tree_inSER_density%>%
+            group_by(IDP,CAMPAGNE)%>%
+             summarise(BM_mean=mean(BM,na.rm=T))->IFN_tree_inSER_density_mean
+        IFN_tree_inSER_density_ratio<-left_join(IFN_tree_inSER_density_max,IFN_tree_inSER_density_mean)
+        
+        
+        dom_mean_mod<-lm(data=IFN_tree_inSER_density_ratio,BM_mean~0+I(BM))
+        dom_mean_ratio<-dom_mean_mod$coefficients
+        
+        IFN_tree_inSER_density_ratio%>%
+  ggplot()+
+  aes(x=BM,y=BM_mean)+
+  geom_point()+
+  geom_smooth(method="lm")+
+          ggtitle(paste0("ratio =", dom_mean_ratio))->gg_ratio
+        gg_ratio_name <- paste0("ratio_", fire_name, ".png")
+        ggsave(
+          gg_ratio,
+          filename = gg_ratio_name,
+          path = paste0(figure_method_path, fire_name)
+        )
+        
+        BM_onetree<-BM_onetree*dom_mean_ratio
+        
+        ##GEt k (intercept) of 3/2 law
+        data_to_fit <-
+          data.frame(x = IFN_tree_inSER_density$pop_density / 100, y = IFN_tree_inSER_density$BM)
+        k <-
+          mean(log10(data_to_fit$y) + 1.5 * log10(data_to_fit$x),
+               na.rm = T)
+        
+        seq_t <- seq(0.5, 40, 0.1)
+        
+        data_to_fit %>%
+          ggplot() +
+          aes(x = log10(x), y = log10(y)) +
+          geom_point(alpha = 0.05, cex = 3) +
+          xlim(0, 2.5) +
+          ylim(0, 4) +
+          geom_abline(intercept = k,
+                      slope = -1.5,
+                      col = "red") +
+          theme_light() -> gg_32rule
+        gg_32rule_name <- paste0("32rule_", fire_name, ".png")
+        ggsave(
+          gg_32rule,
+          filename = gg_32rule_name,
+          path = paste0(figure_method_path, fire_name)
+        )
+        
+        
+        ggplot() +
+          geom_point(data = data_to_fit,
+                     aes(x = x, y = y),
+                     alpha = 0.3,
+                     cex = 2) +
+          geom_line(aes(x = seq_t, y = exp((
+            k + (-1.5) * log10(seq_t)
+          ))), col = "red") +
+          theme_light() -> gg_32rule_simple
+        gg_32rule_simple_name <-
+          paste0("32rule_simple_", fire_name, ".png")
+        ggsave(
+          gg_32rule_simple,
+          filename = gg_32rule_simple_name,
+          path = paste0(figure_method_path, fire_name)
+        )
+        
+        #BM prediction for whole forest of cell (kg/100m²)============================
+        ##Predict BM of forest in fire patch------------------------------------------
+        Density_forest <- 10 ^ ((log10(BM_onetree) - k) / (-1.5))
+        Density_forest[Density_forest == Inf] <- 0
+        raster_Density_forest_name <-
+    paste0("raster_Density_forest_", fire_name, ".png")
+        png(filename = paste0(figure_method_path, fire_name, "/", raster_Density_forest_name))
+  plot(Density_forest)
+  dev.off()
+        
+        
+        BM_forest <- BM_onetree * Density_forest
+        
+        BM_forest <- BM_forest * (COP_TC_masked/100) 
+        
+        
+        BM_forest <- BM_forest / 10#from kg/100m² to ton/ha
+        BM_forest[BM_forest <= 4] <- 0
+        
+      } else{
+        tile_masked[tile_masked] <- 0
+        BM_forest <- tile_masked
+      }
+      CLC_scler_cropped <- st_crop(CLC_scler, tile_masked)
+      if (dim(CLC_scler_cropped)[1] >= 1) {
+        BM_scler <- mask(BM_forest, CLC_scler_cropped)
+        BM_forest[BM_forest == 0 & !is.na(BM_scler)] <- 10
+      }
+      
+      BM_forest[BM_forest == 0] <- 4
+      
+      # CLC_cropped<-crop(CLC,tile_masked,snap="out")
+      #   CLC_comparable<-resample(CLC_cropped,tile_masked,"ngb")
+      #   CLC_masked<-mask(CLC_comparable,tile_masked)
+      #   BM_forest[BM_forest==0&CLC_masked==323]<-8
+    }
+  }
+  if (!BM_tree_height) {
+    BM_forest <- tile_masked
+  }
+  
+  
+  BM_forest_name <- paste0("BM_forest_", fire_name, ".tif")
+  writeRaster(BM_forest,
+              filename = paste0(figure_method_path, fire_name, "/", BM_forest_name))
+  
+  ###Plot BM predictions and save it
+  raster_BM_forest_name <-
+    paste0("raster_BM_forest_", fire_name, ".png")
+  png(filename = paste0(figure_method_path, fire_name, "/", raster_BM_forest_name))
+  plot(BM_forest)
+  dev.off()
+  
+  #PLot output ~ input (BM~tree_height)
+  # plot(tile_masked,BM_forest,maxpixels=100000)
+  
+  
+  sum_BM_kg <- cellStats(BM_forest / 100, 'sum')#t/ha to t/100m²
+  fire_area_m2 <-
+    length(which(!is.na(BM_forest@data@values))) * 100
+  # if(length(k)==0|length(mod1)==0){
+  #   k=NA
+  #   mod1$coefficients<-NA
+  #   }
+  fire_focused%>%
+    summarise(geometry=st_union(geometry),
+                #BurnDate=BurnDate[1],
+              area_m2=st_area(geometry),
+              Bm_affected_t=sum_BM_kg)->fire_focused
+  st_write(fire_focused,
+           paste0(figure_method_path, fire_name, "/", fire_focused_name))
+  
+  return(
+    c(
+      "method_name" = method_name,
+      "fire_name" = fire_name,
+      "sum_BM_kg" = sum_BM_kg,
+      "fire_area_m2" = fire_area_m2
+      # "k"=k,
+      # "alpha"=mod1$coefficients
+    )
+  )
+}
+
+```
+
+```{r}
+for(fire_DB in c("BAMTS/BM_pred","FIRMS.BAMTS","MODIS_BA.BAMTS")){
+  for(BM_DB in c("Schwartz/merged","ESACCI","Potapov", "GFED/GFED500France_forFlorent/Mean_stem_pool")){
+
+#Which Fire DB ? Choose between "BAMTS/BM_pred" and "FIRMS.BAMTS"
+fire_DB_name<-str_extract(fire_DB,pattern = "[:alpha:]+")
+#Which Biomass DB ? Choose between "Schwartz/merged","Globbiomass","ESACCI","Potapov" and "GFED/GFED500France_forFlorent/Mean_stem_pool"
+suffix_raster=".tif$"
+BM_DB_name<-str_extract(BM_DB,pattern = "[:alpha:]+")
+BM_tree_height<-F
+BM_fine_resolution<-F
+if(BM_DB_name=="Schwartz"){
+  BM_DB_name="OwnMethod"
+  BM_tree_height<-T
+  BM_fine_resolution<-T
+}
+
+if(BM_DB_name=="Potapov"){
+  BM_tree_height<-T
+  }
+
+
+method_name<-paste0(BM_DB_name,"x",fire_DB_name,"_NEW")
+figure_method_path<-paste0(figureP, method_name,"/")
+dir.create(figure_method_path)
+
+#fire data
+fire_path<-"D:/Fire/"
+fire_folder <- paste0(fire_path,fire_DB,"/")
+list_fire<-list.files(fire_folder,pattern=".shp")
+list_fire<-str_sub(list_fire,end=-5)
+
+#Biomass or TreeHeight data
+#Always gat Schwartz DB as reference
+BM_path<-"D:/Forest/"
+BM_folder <- paste0(BM_path,"Schwartz/merged/")
+tile_full_name <- "Export_2022-12-09-WGS84_FULL.tif"
+tile_full_Schwartz <- raster(paste0(BM_folder, tile_full_name))
+
+BM_folder <- paste0(BM_path,BM_DB,"/")
+tile_full_name <- list.files(BM_folder,pattern=suffix_raster)
+tile_full <- raster(paste0(BM_folder, tile_full_name))
+Fire_List_Components<-list()
+i=0
+for(fire_name in list_fire[1:length(list_fire)]){
+  i=i+1
+  print(i)
+  Fire_List_Components[[i]]<-get.fireBM(fire_name)
+}
+Fire_Components<-bind_rows(Fire_List_Components)
+  }
+}
+```
+
+
+```{r}
+# Fire_List_Components<-list()
+# i=0
+# for(fire_name in list_fire[1:length(list_fire)]){
+#   i=i+1
+#   print(i)
+#   Fire_List_Components[[i]]<-get.fireBM(fire_name)
+# }
+# Fire_Components<-bind_rows(Fire_List_Components)
+# 
+# dir.create(paste0(figure_method_path,"Global/"))
+# write_csv2(Fire_Components, paste0(figure_method_path,"Global/Fire_Components_",str_sub(method_name,end=-2),".csv"))
+# 
+# Fire_Components%>%
+#   mutate(fire_area_m2=as.numeric(fire_area_m2),
+#          sum_BM_kg=as.numeric(sum_BM_kg))->Fire_Components
+# 
+# Fire_Components%>%
+#   ggplot()+
+#   aes(x=reorder(fire_name,sum_BM_kg),y=sum_BM_kg,fill=dominant_species_scname)+
+#   geom_col()+
+#   theme(axis.text.x = element_text(angle=90, vjust=0.5))->gg_col
+# gg_col_name<-paste0("ggcol_",str_sub( method_name,end=-2), ".png")
+# ggsave(gg_col,filename = gg_col_name,path=paste0(figure_method_path,"Global/"),width=10,height=10)
+# 
+# Fire_Components%>%  
+# ggplot()+
+#   aes(x=fire_area_m2,y=sum_BM_kg,label=dominant_species_scname)+
+#   geom_point()+
+#   geom_text(size=2,nudge_x=8000000)+
+#   labs(x="Fire area (m²)",
+#        y="Forest Biomass (kg)")+
+#   theme_light()->gg_point
+# gg_point_name<-paste0("ggpoint_",str_sub( method_name,end=-2), ".png")
+# ggsave(gg_point,filename = gg_point_name,path=paste0(figure_method_path,"Global/"),width=10,height=10)
+
+test<-get.fireBM("BAMT_BA_BAMT_S2MSI_20230726-20230728_TILE-44N008E_SHP")
+```
+
